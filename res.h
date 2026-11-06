@@ -27,4 +27,11 @@
 #define IDC_A_SUM    406
 #define IDC_A_EV     407
 #define IDC_A_COPY   408
-#define IDC_A_WEB    409
+#define IDC_A_MORE   409
+#define IDD_ANALYZE_FULL 410
+#define IDC_MTR      315
+#define IDC_PACK     316
+#define IDD_MTR      500
+#define IDC_M_LIST   501
+#define IDC_M_HDR    502
+#define IDC_M_COPY   503

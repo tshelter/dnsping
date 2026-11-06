@@ -1,25 +1,41 @@
-# DNS Ping 10 Hz
+# DNS Ping
 
-Tiny (~35 KB) Win32 app: probes a DNS server over UDP (or any host via ICMP ping) at a fixed rate (10 Hz default)
-and logs every probe to CSV compatible with https://zxc.sx/ping-analyzer
-(`Timestamp,Ping (ms),Jitter (ms)`, losses = `PACKET_LOSS`). Similar to pingpackettest.com.
+Tiny (~70 KB, no CRT, no installer, no admin) Win32 network stability logger.
+Probes a target at a fixed rate (1–100 Hz, default 10 Hz) and records everything needed
+to explain an outage afterwards.
 
-- Every query is unique: transaction id = seq + random salt, matched against the echoed question.
-  - *Cached name (0x20)*: random letter case of a popular domain → resolver answers from cache,
-    measures pure network RTT.
-  - *Random subdomain*: `<seq>-<rand>.<domain>` → cache-busting (includes resolver recursion time).
-- Reply after timeout = loss. Jitter = |ping − previous successful ping|.
-- Analyze… (v3) opens the built-in analyzer: last recording (or newest *ping_*.csv on the Desktop)
-  or any CSV; timeline, summary (loss, outages, longest, p50/p95/p99, jitter), outage list,
-  Copy report, and an "Open in zxc.sx" fallback. Outage duration = last − first lost + 1 interval.
+## Modes
+- **DNS, cached name (0x20)** — unique UDP queries to a DNS server for a popular domain with
+  random letter case; answered from cache, so it measures the network path.
+- **DNS, random subdomain** — cache-busting; includes resolver recursion time.
+- **ICMP ping** — IcmpSendEcho2 / Icmp6SendEcho2, async, no admin rights; unique payload per echo.
+- **HTTP HEAD (curl -I)** — WinHTTP, fresh connection per probe (DNS+TCP+TLS+request),
+  redirects not followed, response headers capped at 16 KB, no body read.
 
-Pure C, no CRT, Win10+ x64. Build on the server: `./build.sh` (mingw-w64 from nixpkgs).
+Every probe that gets no valid reply within the timeout is `PACKET_LOSS`.
 
-ICMP ping mode (v2): IcmpSendEcho2 / Icmp6SendEcho2 — async, works without admin rights,
-unique 16-byte payload per echo (verified on reply). RTT measured with QPC, not the 1 ms field.
+## Session folder (Desktop\dnsping\<mode>_<target>_<time>\)
+ping.csv (zxc.sx/pingpackettest compatible), mtr.csv + mtr.txt, events.log, wifi.csv,
+iface.csv, system.txt (START/END snapshots), readme.txt. **Pack & share** zips the folder and
+puts the zip on the clipboard (paste into a chat) + opens Explorer.
 
-v3 also: rates 1–100 Hz; DNS mode re-creates its UDP socket after ≥1 s of solid loss
-(a reconnect can change the local IP and a connected socket would stay on the old one).
+## Background during a test
+- MTR to the target, 1 round/s, reverse DNS, pathping-style notes (filtered hops, rate-limit,
+  where loss starts). Live window: **MTR...**
+- Monitor, 1/s: Wi-Fi (SSID/BSSID/RSSI/channel/rates; connect, disconnect, roam, signal bands),
+  adapters (link up/down, IP/gateway/DNS changes), best route to target, interface counters,
+  power source.
 
-Releases: `release/dnsping-v1.exe` (DNS only), `release/dnsping-v2.exe` (+ ICMP),
-`release/dnsping-v3.exe` (+ built-in analyzer, 50/100 Hz, reconnect fix).
+## Analyzer
+Simple view by default (timeline, summary, outages). **Details >>** adds Wi-Fi RSSI and event
+markers on the timeline, network-event counters, and per-outage **Where** (from MTR: LAN/Wi-Fi,
+ISP from hop N, or target only) and **Context** (RSSI and nearby events).
+Outage duration = last − first lost + one interval.
+
+## Build
+`./build.sh` (mingw-w64 from nixpkgs). Tested under Wine on the server: Wine can't receive
+ICMP TTL-exceeded (MTR middle hops show *) and lacks TLS (HTTPS fails) — both work on Windows.
+
+## Releases
+`release/dnsping-v1.exe` DNS only · `v2` + ICMP · `v3` + analyzer, 50/100 Hz ·
+`v4` + session folder, MTR, network monitor, HTTP HEAD, Pack & share, analyzer details.

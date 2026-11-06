@@ -10,15 +10,13 @@
  * ICMP mode uses IcmpSendEcho2/Icmp6SendEcho2 (async, no admin rights needed);
  * each echo carries a unique 16-byte payload that must come back intact.
  *
+ * v4: session folder with MTR, Wi-Fi, interface counters, network events and
+ * system snapshot (see netmon.c, mtr.c); Pack & share zips it.
+ *
  * Built without the C runtime (see build.sh) to keep the .exe tiny.
  */
-#define UNICODE
-#define _UNICODE
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "common.h"
 #include <mstcpip.h>
-#include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -26,6 +24,7 @@
 #include <mmsystem.h>
 #include <iphlpapi.h>
 #include <icmpapi.h>
+#include <winhttp.h>
 #include "res.h"
 
 #ifndef SIO_UDP_CONNRESET
@@ -37,6 +36,7 @@ void *memset(void *d, int c, size_t n) { unsigned char *p = d; while (n--) *p++ 
 void *memcpy(void *d, const void *s, size_t n) { unsigned char *p = d; const unsigned char *q = s; while (n--) *p++ = *q++; return d; }
 
 #define WM_APP_DONE (WM_APP + 1)
+#define WM_APP_FIN  (WM_APP + 2)
 #define NSLOT 1024
 #define GN 300                       /* graph window: samples */
 #define FBUF 65536
@@ -63,15 +63,19 @@ typedef struct {
 
 typedef struct {
     struct sockaddr_storage addr;
-    int addrlen, mode, /* 0 dns 0x20, 1 dns random, 2 icmp */ period_ms, timeout_ms;
+    int addrlen, mode, /* 0 dns 0x20, 1 dns random, 2 icmp, 3 http head */ period_ms, timeout_ms;
     unsigned total;
     char domain[72];
     HANDLE file;
+    WCHAR url[512], host[256], path[512];      /* HTTP mode */
+    INTERNET_PORT port;
+    int secure;
 } Cfg;
 
 static HINSTANCE g_inst;
 static HWND g_dlg;
-static HANDLE g_thread, g_stop;
+static HANDLE g_thread, g_mtr, g_mon;
+HANDLE g_stop;
 static CRITICAL_SECTION g_cs;
 static Cfg g_cfg;
 static Slot g_slots[NSLOT];
@@ -195,6 +199,14 @@ static int ieq(unsigned char a, unsigned char b)
     return a == b;
 }
 
+static void log_outage(const FILETIME *st, unsigned n, int period)
+{
+    char t[32];
+    unsigned ms = n * (unsigned)period;
+    ts_ft(t, st);
+    ev_log("PING", "%s %u lost (%u.%u s) from %s", n * (unsigned)period >= 1000 ? "OUTAGE" : "drop", n, ms / 1000, ms % 1000 / 100, t + 11);
+}
+
 static SOCKET open_sock(Cfg *c, WSAEVENT ev)
 {
     DWORD br, f = FALSE;
@@ -205,16 +217,94 @@ static SOCKET open_sock(Cfg *c, WSAEVENT ev)
     return s;
 }
 
+/* HTTP HEAD like `curl -I`: a fresh connection (DNS + TCP + TLS + request) every probe. */
+static DWORD g_httperr;
+static int http_probe(HINTERNET ses, Cfg *c, DWORD *status)
+{
+    HINTERNET hc, hr = NULL;
+    DWORD opt = WINHTTP_DISABLE_KEEP_ALIVE, sz = sizeof *status;
+    DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_NEVER, maxhdr = 16384, drain = 0;
+    int ok = 0;
+    *status = 0;
+    g_httperr = 0;
+    hc = WinHttpConnect(ses, c->host, c->port, 0);
+    if (hc) hr = WinHttpOpenRequest(hc, L"HEAD", c->path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                    WINHTTP_FLAG_REFRESH | (c->secure ? WINHTTP_FLAG_SECURE : 0));
+    if (hr) {
+        WinHttpSetTimeouts(hr, c->timeout_ms, c->timeout_ms, c->timeout_ms, c->timeout_ms);
+        WinHttpSetOption(hr, WINHTTP_OPTION_DISABLE_FEATURE, &opt, sizeof opt);
+        WinHttpSetOption(hr, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof redir);         /* like curl -I: no follow */
+        WinHttpSetOption(hr, WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, &maxhdr, sizeof maxhdr);
+        WinHttpSetOption(hr, WINHTTP_OPTION_MAX_RESPONSE_DRAIN_SIZE, &drain, sizeof drain);
+        if (WinHttpSendRequest(hr, L"Cache-Control: no-cache\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(hr, NULL)) {
+            WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                status, &sz, WINHTTP_NO_HEADER_INDEX);
+            ok = 1;
+        } else g_httperr = GetLastError();
+        WinHttpCloseHandle(hr);
+    }
+    else if (!g_httperr) g_httperr = GetLastError();
+    if (hc) WinHttpCloseHandle(hc);
+    return ok;
+}
+
+static DWORD http_worker(Cfg *c)
+{
+    HINTERNET ses = WinHttpOpen(L"DNSPing/" APP_VERSION_W, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    LARGE_INTEGER fq;
+    LONGLONG per, next, lastflush;
+    unsigned nseq = 0, runloss = 0;
+    DWORD st, pst = (DWORD)-1;
+    FILETIME ostart;
+    static Slot sl;
+
+    QueryPerformanceFrequency(&fq);
+    per = fq.QuadPart * c->period_ms / 1000;
+    fput("Timestamp,Ping (ms),Jitter (ms)\r\n", 33);
+    next = lastflush = qpc();
+    while (ses && (c->total == 0 || nseq < c->total)) {
+        LONGLONG now = qpc(), t0;
+        int ok;
+        if (now < next && WaitForSingleObject(g_stop, (DWORD)((next - now) * 1000 / fq.QuadPart)) != WAIT_TIMEOUT) break;
+        if (WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0) break;
+        GetSystemTimePreciseAsFileTime(&sl.ft);
+        t0 = qpc();
+        ok = http_probe(ses, c, &st);
+        now = qpc();
+        sl.rtt_us = (int)((now - t0) * 1000000 / fq.QuadPart);
+        sl.state = ok && sl.rtt_us <= c->timeout_ms * 1000 ? 1 : 2;
+        if (ok && st != pst) { ev_log("HTTP", "status %lu", st); pst = st; }
+        if (!ok && pst != 0) { ev_log("HTTP", "request failed (WinHTTP error %lu)", g_httperr); pst = 0; }
+        if (sl.state == 2 && !runloss) ostart = sl.ft;
+        if (sl.state == 1 && runloss) log_outage(&ostart, runloss, c->period_ms);
+        runloss = sl.state == 2 ? runloss + 1 : 0;
+        write_row(&sl);
+        nseq++;
+        next += per;
+        if (now > next) next = now;                    /* a slow request delays the next one, no bursts */
+        if (now - lastflush > fq.QuadPart) { fflush_buf(); lastflush = now; }
+    }
+    if (runloss) log_outage(&ostart, runloss, c->period_ms);
+    if (!ses) ev_log("HTTP", "WinHttpOpen failed (%lu)", GetLastError());
+    else WinHttpCloseHandle(ses);
+    fflush_buf();
+    CloseHandle(c->file);
+    PostMessageW(g_dlg, WM_APP_DONE, 0, 0);
+    return 0;
+}
+
 static DWORD WINAPI worker(LPVOID arg)
 {
     Cfg *c = &g_cfg;
-    unsigned char pkt[512];
+    unsigned char pkt[4096];
     LARGE_INTEGER fq;
     LONGLONG per, tmo, next, now, lastflush;
     unsigned nseq = 0, wseq = 0;
     unsigned short salt = (unsigned short)rnd();
     int stopping = 0, i, r;
     unsigned runloss = 0;
+    FILETIME ostart;
     LONGLONG lastreopen = 0;
     HANDLE hs[64], ih = INVALID_HANDLE_VALUE;
     int icmp = c->mode == 2, v6 = c->addr.ss_family == AF_INET6;
@@ -222,6 +312,7 @@ static DWORD WINAPI worker(LPVOID arg)
     WSAEVENT ev;
     (void)arg;
 
+    if (c->mode == 3) return http_worker(c);
     QueryPerformanceFrequency(&fq);
     per = fq.QuadPart * c->period_ms / 1000;
     tmo = fq.QuadPart * c->timeout_ms / 1000;
@@ -327,6 +418,8 @@ static DWORD WINAPI worker(LPVOID arg)
             if (sl->state == 0) {
                 if (now - sl->t >= tmo) sl->state = 2; else break;
             }
+            if (sl->state == 2 && !runloss) ostart = sl->ft;
+            if (sl->state == 1 && runloss) log_outage(&ostart, runloss, c->period_ms);
             runloss = sl->state == 2 ? runloss + 1 : 0;
             write_row(sl);
             wseq++;
@@ -360,6 +453,7 @@ static DWORD WINAPI worker(LPVOID arg)
     }
 
     timeEndPeriod(1);
+    if (runloss) log_outage(&ostart, runloss, c->period_ms);
     fflush_buf();
     CloseHandle(c->file);
     if (icmp) IcmpCloseHandle(ih);
@@ -376,36 +470,73 @@ static void fmt_ms_w(WCHAR *b, int us)
     wsprintfW(b, L"%d.%d", t / 10, t % 10);
 }
 
-static void make_autopath(void)
+static int has_scheme(const WCHAR *t)
 {
-    WCHAR dir[MAX_PATH], srv[64];
-    SYSTEMTIME st;
+    int i;
+    for (i = 0; t[i] && i < 10; i++) if (t[i] == L':' && t[i + 1] == L'/' && t[i + 2] == L'/') return 1;
+    return 0;
+}
+
+static void make_autopath(void)          /* default output folder: Desktop\dnsping */
+{
+    WCHAR dir[MAX_PATH];
     int i;
     if (SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, dir) != S_OK) {
         GetModuleFileNameW(NULL, dir, MAX_PATH);
         for (i = lstrlenW(dir); i > 0 && dir[i - 1] != L'\\'; i--) ;
         dir[i ? i - 1 : 0] = 0;
     }
-    GetDlgItemTextW(g_dlg, IDC_SERVER, srv, 64);
-    for (i = 0; srv[i]; i++)
-        if (srv[i] == L':' || srv[i] == L'/' || srv[i] == L'\\' || srv[i] == L'*' || srv[i] == L'?') srv[i] = L'-';
-    GetLocalTime(&st);
-    wsprintfW(g_autopath, L"%s\\%s_%s_%04d%02d%02d-%02d%02d%02d.csv", dir,
-              SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) == 2 ? L"icmpping" : L"dnsping", srv,
-              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    wsprintfW(g_autopath, L"%s\\dnsping", dir);
+}
+
+static const char k_readme[] =
+    "DNS Ping session folder\r\n\r\n"
+    "ping.csv     main probe log (Timestamp, Ping, Jitter; PACKET_LOSS = no reply in time).\r\n"
+    "             Same format as pingpackettest.com / zxc.sx/ping-analyzer.\r\n"
+    "mtr.csv      MTR in time: one ICMP probe per hop per second (Hop, IP, RTT or PACKET_LOSS).\r\n"
+    "mtr.txt      final MTR table with notes (where loss starts, filtered hops).\r\n"
+    "events.log   one timeline of what happened: link up/down, IP/gateway/DNS/route changes,\r\n"
+    "             Wi-Fi connect/disconnect/roam/signal, power source, ping outages.\r\n"
+    "wifi.csv     Wi-Fi every second: SSID, BSSID, signal %, RSSI dBm, channel, link rates.\r\n"
+    "iface.csv    traffic and errors on the interface that carries the test, every second.\r\n"
+    "system.txt   snapshot at START and END: Windows, adapters, IPs, gateways, DNS, routes,\r\n"
+    "             Wi-Fi details and nearby access points.\r\n";
+
+static void write_readme(void)
+{
+    OutFile f;
+    if (of_open(&f, L"readme.txt", NULL)) { of_put(&f, k_readme, sizeof k_readme - 1); of_close(&f); }
 }
 
 static void set_status(const WCHAR *s) { SendDlgItemMessageW(g_dlg, IDC_STATUS, SB_SETTEXTW, 0, (LPARAM)s); }
 
 static void sync_mode(void)
 {
-    int icmp = SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) == 2;
-    EnableWindow(GetDlgItem(g_dlg, IDC_DOMAIN), !icmp);
+    int m = (int)SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0);
+    EnableWindow(GetDlgItem(g_dlg, IDC_DOMAIN), m < 2);
+}
+
+static void mode_changed(void)            /* keep the target field sensible for the new mode */
+{
+    int m = (int)SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0), i, j;
+    WCHAR t[512], o[600];
+    GetDlgItemTextW(g_dlg, IDC_SERVER, t, 512);
+    if (m == 3 && !has_scheme(t)) {
+        wsprintfW(o, L"https://%s/", t[0] ? t : L"www.google.com");
+        SetDlgItemTextW(g_dlg, IDC_SERVER, o);
+    } else if (m != 3 && has_scheme(t)) {
+        for (i = 0; t[i] && !(t[i] == L':' && t[i + 1] == L'/' && t[i + 2] == L'/'); i++) ;
+        i += 3;
+        for (j = 0; t[i] && t[i] != L'/' && t[i] != L':' && j < 511; ) o[j++] = t[i++];
+        o[j] = 0;
+        SetDlgItemTextW(g_dlg, IDC_SERVER, o);
+    }
+    sync_mode();
 }
 
 static void enable_inputs(BOOL on)
 {
-    static const int ids[] = { IDC_SERVER, IDC_MODE, IDC_DOMAIN, IDC_RATE, IDC_DUR, IDC_TMO, IDC_PATH, IDC_BROWSE };
+    static const int ids[] = { IDC_SERVER, IDC_MODE, IDC_DOMAIN, IDC_RATE, IDC_DUR, IDC_TMO, IDC_PATH, IDC_BROWSE, IDC_PACK };
     int i;
     for (i = 0; i < (int)(sizeof ids / sizeof ids[0]); i++) EnableWindow(GetDlgItem(g_dlg, ids[i]), on);
     if (on) sync_mode();
@@ -503,16 +634,39 @@ static void start(void)
     WCHAR b[MAX_PATH + 64], domw[72];
     int i, sel;
 
-    GetDlgItemTextW(g_dlg, IDC_SERVER, g_server, 128);
-    WideCharToMultiByte(CP_ACP, 0, g_server, -1, host, sizeof host, NULL, NULL);
-    for (i = 0; host[i] == ' '; i++) ;
+    {
+        int mode = (int)SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0);
+        WCHAR raw[512], hw[256];
+        URL_COMPONENTS uc;
+        GetDlgItemTextW(g_dlg, IDC_SERVER, raw, 512);
+        for (i = 0; raw[i] == L' '; i++) ;
+        memset(&g_cfg, 0, sizeof g_cfg);
+        if (mode == 3 && !has_scheme(raw + i)) wsprintfW(g_cfg.url, L"https://%s", raw + i);
+        else lstrcpynW(g_cfg.url, raw + i, 512);
+        memset(&uc, 0, sizeof uc);
+        uc.dwStructSize = sizeof uc;
+        uc.lpszHostName = g_cfg.host; uc.dwHostNameLength = 256;
+        uc.lpszUrlPath = g_cfg.path; uc.dwUrlPathLength = 512;
+        if (has_scheme(g_cfg.url)) {
+            if (!WinHttpCrackUrl(g_cfg.url, 0, 0, &uc) || !g_cfg.host[0]) {
+                MessageBoxW(g_dlg, L"Cannot parse the URL. Example: https://www.google.com/", L"DNS Ping", MB_ICONERROR);
+                return;
+            }
+            g_cfg.port = uc.nPort; g_cfg.secure = uc.nScheme == INTERNET_SCHEME_HTTPS;
+            if (!g_cfg.path[0]) lstrcpyW(g_cfg.path, L"/");
+            lstrcpynW(hw, g_cfg.host, 256);
+        } else lstrcpynW(hw, g_cfg.url, 256);
+        for (i = lstrlenW(hw); i > 0 && hw[i - 1] == L' '; i--) hw[i - 1] = 0;
+        lstrcpynW(g_server, mode == 3 ? g_cfg.url : hw, 128);
+        WideCharToMultiByte(CP_ACP, 0, hw, -1, host, sizeof host, NULL, NULL);
+        i = 0;
+    }
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM; hints.ai_protocol = IPPROTO_UDP;
     if (getaddrinfo(host + i, "53", &hints, &ai) != 0 || !ai) {
-        MessageBoxW(g_dlg, L"Cannot resolve the DNS server address.", L"DNS Ping", MB_ICONERROR);
+        MessageBoxW(g_dlg, L"Cannot resolve the target address.", L"DNS Ping", MB_ICONERROR);
         return;
     }
-    memset(&g_cfg, 0, sizeof g_cfg);
     memcpy(&g_cfg.addr, ai->ai_addr, ai->ai_addrlen);
     g_cfg.addrlen = (int)ai->ai_addrlen;
     freeaddrinfo(ai);
@@ -521,7 +675,7 @@ static void start(void)
     WideCharToMultiByte(CP_ACP, 0, domw, -1, dom, 64, NULL, NULL);
     for (i = 0; dom[i]; i++) ;
     while (i > 0 && (dom[i - 1] == '.' || dom[i - 1] == ' ')) dom[--i] = 0;
-    if (!dom[0] && SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) != 2) { MessageBoxW(g_dlg, L"Enter a domain to query.", L"DNS Ping", MB_ICONERROR); return; }
+    if (!dom[0] && SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) < 2) { MessageBoxW(g_dlg, L"Enter a domain to query.", L"DNS Ping", MB_ICONERROR); return; }
     lstrcpyA(g_cfg.domain, dom);
 
     g_cfg.mode = (int)SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0);
@@ -530,15 +684,24 @@ static void start(void)
     sel = (int)SendDlgItemMessageW(g_dlg, IDC_DUR, CB_GETCURSEL, 0, 0);
     g_cfg.total = (unsigned)(k_dur_s[sel] * 1000 / g_cfg.period_ms);
 
-    GetDlgItemTextW(g_dlg, IDC_PATH, g_path, MAX_PATH);
-    if (!g_path[0] || !lstrcmpW(g_path, g_autopath)) {
-        make_autopath();
-        lstrcpyW(g_path, g_autopath);
-        SetDlgItemTextW(g_dlg, IDC_PATH, g_path);
+    {
+        WCHAR base[MAX_PATH], srv[64];
+        SYSTEMTIME st;
+        GetDlgItemTextW(g_dlg, IDC_PATH, base, MAX_PATH);
+        if (!base[0]) { make_autopath(); lstrcpyW(base, g_autopath); SetDlgItemTextW(g_dlg, IDC_PATH, base); }
+        for (i = lstrlenW(base); i > 0 && (base[i - 1] == L'\\' || base[i - 1] == L' '); i--) base[i - 1] = 0;
+        lstrcpynW(srv, g_cfg.mode == 3 ? g_cfg.host : g_server, 64);
+        for (i = 0; srv[i]; i++)
+            if (srv[i] == L':' || srv[i] == L'/' || srv[i] == L'\\' || srv[i] == L'*' || srv[i] == L'?' || srv[i] == L' ') srv[i] = L'-';
+        GetLocalTime(&st);
+        wsprintfW(g_sessdir, L"%s\\%s_%s_%04d%02d%02d-%02d%02d%02d", base, g_cfg.mode == 3 ? L"http" : g_cfg.mode == 2 ? L"icmp" : L"dns", srv,
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        SHCreateDirectoryExW(NULL, g_sessdir, NULL);
+        wsprintfW(g_path, L"%s\\ping.csv", g_sessdir);
     }
     g_cfg.file = CreateFileW(g_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (g_cfg.file == INVALID_HANDLE_VALUE) {
-        MessageBoxW(g_dlg, L"Cannot create the output file.", L"DNS Ping", MB_ICONERROR);
+        MessageBoxW(g_dlg, L"Cannot create the session folder.", L"DNS Ping", MB_ICONERROR);
         return;
     }
 
@@ -561,25 +724,60 @@ static void start(void)
         }
     }
 
+    write_readme();
+    of_open(&g_events, L"events.log", NULL);
+    {
+        char desc[256], ip[64];
+        static const char *mn[] = { "DNS query (cached name, 0x20)", "DNS query (random subdomain)", "ICMP ping", "HTTP HEAD (curl -I)" };
+        addr_str(&g_cfg.addr, ip, sizeof ip);
+        wsprintfA(desc, "%s -> %S (%s), every %d ms, timeout %d ms%s%s", mn[g_cfg.mode], g_server, ip, g_cfg.period_ms, g_cfg.timeout_ms,
+                  g_cfg.mode >= 2 ? "" : ", domain ", g_cfg.mode >= 2 ? "" : g_cfg.domain);
+        ev_log("START", "%s", desc);
+        g_mon = netmon_start(&g_cfg.addr, desc);
+        g_mtr = mtr_start(&g_cfg.addr);
+    }
+
     g_running = 1;
     enable_inputs(FALSE);
     SetDlgItemTextW(g_dlg, IDC_START, L"STOP");
-    wsprintfW(b, L"%s %s every %d ms...", g_cfg.mode == 2 ? L"Pinging" : L"Querying", g_server, g_cfg.period_ms);
+    wsprintfW(b, L"%s %s every %d ms...", g_cfg.mode == 3 ? L"HEAD" : g_cfg.mode == 2 ? L"Pinging" : L"Querying", g_server, g_cfg.period_ms);
     set_status(b);
     SetTimer(g_dlg, 1, 100, NULL);
     g_thread = CreateThread(NULL, 0, worker, NULL, 0, NULL);
 }
 
-static void stop_and_wait(DWORD ms)
+static int g_closing;
+
+static DWORD WINAPI finisher(LPVOID a)
 {
-    if (!g_running) return;
-    SetEvent(g_stop);
-    WaitForSingleObject(g_thread, ms);
+    HANDLE hs[3];
+    (void)a;
+    SetEvent(g_stop);                                      /* duration over / stop: MTR + monitor too */
+    hs[0] = g_thread; hs[1] = g_mtr; hs[2] = g_mon;
+    WaitForMultipleObjects(3, hs, TRUE, INFINITE);         /* each thread is bounded (timeouts) */
+    ev_log("STOP", "%u probes, %u lost", g_st.written, g_st.lost);
+    of_close(&g_events);
+    PostMessageW(g_dlg, WM_APP_FIN, 0, 0);
+    return 0;
 }
 
-void analyze_open(HWND parent, const WCHAR *last);
 static int g_recorded;
-static void analyze(void) { analyze_open(g_dlg, g_recorded ? g_path : NULL); }
+
+static void pack(void)
+{
+    WCHAR zp[MAX_PATH + 8], b[MAX_PATH + 96], args[MAX_PATH + 16];
+    int n;
+    if (!g_sessdir[0]) { MessageBoxW(g_dlg, L"Run a test first: the archive packs the last session folder.", L"DNS Ping", MB_ICONINFORMATION); return; }
+    if (g_running) of_flush(&g_events);
+    n = zip_dir(g_sessdir, zp);
+    if (!n) { MessageBoxW(g_dlg, L"Cannot create the archive.", L"DNS Ping", MB_ICONERROR); return; }
+    clipboard_file(g_dlg, zp);
+    wsprintfW(args, L"/select,\"%s\"", zp);
+    ShellExecuteW(g_dlg, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+    wsprintfW(b, L"Archive copied to clipboard (Ctrl+V into a chat): %s", zp);
+    set_status(b);
+}
+static void analyze(void) { analyze_open(g_dlg, g_recorded || g_running ? g_path : NULL); }
 
 static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -602,6 +800,7 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"Cached name (0x20)");
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"Random subdomain");
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"ICMP ping");
+        SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"HTTP HEAD (curl -I)");
         SendDlgItemMessageW(h, IDC_MODE, CB_SETCURSEL, 0, 0);
         SetDlgItemTextW(h, IDC_DOMAIN, L"google.com");
         for (i = 0; i < RATE_N; i++) SendDlgItemMessageW(h, IDC_RATE, CB_ADDSTRING, 0, (LPARAM)k_rate_s[i]);
@@ -622,21 +821,28 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (wp == IDC_GRAPH) { draw_graph((DRAWITEMSTRUCT *)lp); return TRUE; }
         break;
     case WM_TIMER:
+        if (wp == 2) { EndDialog(h, 0); return TRUE; }
         refresh();
         return TRUE;
-    case WM_APP_DONE: {
-        WCHAR b[MAX_PATH + 64];
+    case WM_APP_DONE:                                      /* probe thread ended: finish the rest off the UI thread */
         KillTimer(h, 1);
-        WaitForSingleObject(g_thread, INFINITE);
-        CloseHandle(g_thread);
+        refresh();
+        EnableWindow(GetDlgItem(h, IDC_START), FALSE);
+        set_status(L"Finishing: final MTR table and system snapshot...");
+        CloseHandle(CreateThread(NULL, 0, finisher, NULL, 0, NULL));
+        return TRUE;
+    case WM_APP_FIN: {
+        WCHAR b[MAX_PATH + 64];
+        CloseHandle(g_thread); CloseHandle(g_mtr); CloseHandle(g_mon);
         g_running = 0;
+        if (g_closing) { EndDialog(h, 0); return TRUE; }
         g_recorded = 1;
         refresh();
         SendDlgItemMessageW(h, IDC_PROG, PBM_SETMARQUEE, FALSE, 0);
         enable_inputs(TRUE);
         EnableWindow(GetDlgItem(h, IDC_START), TRUE);
         SetDlgItemTextW(h, IDC_START, L"START");
-        wsprintfW(b, L"Saved %u rows: %s", g_st.written, g_path);
+        wsprintfW(b, L"Saved %u probes to %s", g_st.written, g_sessdir);
         set_status(b);
         return TRUE;
     }
@@ -652,31 +858,43 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         case IDC_MODE:
         case IDC_SERVER:
             if (HIWORD(wp) == CBN_SELCHANGE || HIWORD(wp) == CBN_EDITCHANGE) {
-                WCHAR cur[MAX_PATH];
-                if (LOWORD(wp) == IDC_MODE) sync_mode();
-                if (LOWORD(wp) == IDC_SERVER && HIWORD(wp) == CBN_SELCHANGE) return TRUE;  /* text not updated yet */
-                GetDlgItemTextW(h, IDC_PATH, cur, MAX_PATH);
-                if (!lstrcmpW(cur, g_autopath)) { make_autopath(); SetDlgItemTextW(h, IDC_PATH, g_autopath); }
+                if (LOWORD(wp) == IDC_MODE && HIWORD(wp) == CBN_SELCHANGE) mode_changed();
             }
             return TRUE;
         case IDC_BROWSE: {
-            OPENFILENAMEW of;
+            BROWSEINFOW bi;
             WCHAR fn[MAX_PATH];
-            GetDlgItemTextW(h, IDC_PATH, fn, MAX_PATH);
-            memset(&of, 0, sizeof of);
-            of.lStructSize = sizeof of; of.hwndOwner = h;
-            of.lpstrFilter = L"CSV files (*.csv)\0*.csv\0All files\0*.*\0";
-            of.lpstrFile = fn; of.nMaxFile = MAX_PATH; of.lpstrDefExt = L"csv";
-            of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-            if (GetSaveFileNameW(&of)) SetDlgItemTextW(h, IDC_PATH, fn);
+            LPITEMIDLIST il;
+            memset(&bi, 0, sizeof bi);
+            bi.hwndOwner = h; bi.pszDisplayName = fn;
+            bi.lpszTitle = L"Folder for test sessions (a subfolder is created per test)";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            il = SHBrowseForFolderW(&bi);
+            if (il) {
+                if (SHGetPathFromIDListW(il, fn)) SetDlgItemTextW(h, IDC_PATH, fn);
+                CoTaskMemFree(il);
+            }
             return TRUE;
         }
+        case IDC_MTR:
+            mtr_window(h);
+            return TRUE;
+        case IDC_PACK:
+            pack();
+            return TRUE;
         case IDC_ANALYZE:
             analyze();
             return TRUE;
         case IDCANCEL:
-            stop_and_wait(5000);
-            EndDialog(h, 0);
+            if (!g_running) { EndDialog(h, 0); return TRUE; }
+            if (!g_closing) {                              /* let the files finish, then exit */
+                g_closing = 1;
+                SetEvent(g_stop);
+                EnableWindow(GetDlgItem(h, IDC_START), FALSE);
+                EnableWindow(GetDlgItem(h, IDCANCEL), FALSE);
+                set_status(L"Closing: saving files...");
+                SetTimer(h, 2, 20000, NULL);               /* safety net */
+            }
             return TRUE;
         }
         break;
@@ -690,6 +908,7 @@ void WINAPI entry(void)
     WSADATA wsa;
     LARGE_INTEGER t;
     InitCommonControlsEx(&icc);
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     WSAStartup(MAKEWORD(2, 2), &wsa);
     InitializeCriticalSection(&g_cs);
     QueryPerformanceCounter(&t);
