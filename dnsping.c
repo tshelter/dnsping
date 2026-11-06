@@ -85,8 +85,11 @@ static unsigned g_rng;
 static HFONT g_hfont;
 static int g_running;
 
-static const int k_rate_ms[] = { 100, 50, 200, 500, 1000 };
-static const WCHAR *k_rate_s[] = { L"10 Hz (100 ms)", L"20 Hz (50 ms)", L"5 Hz (200 ms)", L"2 Hz (500 ms)", L"1 Hz (1 s)" };
+static const int k_rate_ms[] = { 1000, 500, 200, 100, 50, 20, 10 };
+static const WCHAR *k_rate_s[] = { L"1 Hz (1 s)", L"2 Hz (500 ms)", L"5 Hz (200 ms)", L"10 Hz (100 ms)",
+                                   L"20 Hz (50 ms)", L"50 Hz (20 ms)", L"100 Hz (10 ms)" };
+#define RATE_N 7
+#define RATE_DEF 3
 static const int k_dur_s[] = { 0, 60, 300, 600, 900, 1800, 3600, 7200 };
 static const WCHAR *k_dur_str[] = { L"Unlimited", L"1 min", L"5 min", L"10 min", L"15 min", L"30 min", L"1 hour", L"2 hours" };
 static const int k_tmo_ms[] = { 500, 1000, 2000 };
@@ -192,6 +195,16 @@ static int ieq(unsigned char a, unsigned char b)
     return a == b;
 }
 
+static SOCKET open_sock(Cfg *c, WSAEVENT ev)
+{
+    DWORD br, f = FALSE;
+    SOCKET s = socket(c->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+    connect(s, (struct sockaddr *)&c->addr, c->addrlen);
+    WSAIoctl(s, SIO_UDP_CONNRESET, &f, sizeof f, NULL, 0, &br, NULL, NULL);
+    WSAEventSelect(s, ev, FD_READ);
+    return s;
+}
+
 static DWORD WINAPI worker(LPVOID arg)
 {
     Cfg *c = &g_cfg;
@@ -201,7 +214,8 @@ static DWORD WINAPI worker(LPVOID arg)
     unsigned nseq = 0, wseq = 0;
     unsigned short salt = (unsigned short)rnd();
     int stopping = 0, i, r;
-    DWORD br, f = FALSE;
+    unsigned runloss = 0;
+    LONGLONG lastreopen = 0;
     HANDLE hs[64], ih = INVALID_HANDLE_VALUE;
     int icmp = c->mode == 2, v6 = c->addr.ss_family == AF_INET6;
     SOCKET s;
@@ -216,11 +230,8 @@ static DWORD WINAPI worker(LPVOID arg)
         ih = v6 ? Icmp6CreateFile() : IcmpCreateFile();
         s = INVALID_SOCKET; ev = NULL;
     } else {
-        s = socket(c->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
-        connect(s, (struct sockaddr *)&c->addr, c->addrlen);
-        WSAIoctl(s, SIO_UDP_CONNRESET, &f, sizeof f, NULL, 0, &br, NULL, NULL);
         ev = WSACreateEvent();
-        WSAEventSelect(s, ev, FD_READ);
+        s = open_sock(c, ev);
     }
     timeBeginPeriod(1);
 
@@ -316,8 +327,16 @@ static DWORD WINAPI worker(LPVOID arg)
             if (sl->state == 0) {
                 if (now - sl->t >= tmo) sl->state = 2; else break;
             }
+            runloss = sl->state == 2 ? runloss + 1 : 0;
             write_row(sl);
             wseq++;
+        }
+        /* After >= 1 s of solid loss, re-create the UDP socket: a reconnect may have
+           changed our local IP and a connected socket would stay bound to the old one. */
+        if (!icmp && runloss * c->period_ms >= 1000 && now - lastreopen > 2 * fq.QuadPart) {
+            closesocket(s);
+            s = open_sock(c, ev);
+            lastreopen = now;
         }
         if (now - lastflush > fq.QuadPart) { fflush_buf(); lastflush = now; }
 
@@ -544,7 +563,6 @@ static void start(void)
 
     g_running = 1;
     enable_inputs(FALSE);
-    EnableWindow(GetDlgItem(g_dlg, IDC_ANALYZE), FALSE);
     SetDlgItemTextW(g_dlg, IDC_START, L"STOP");
     wsprintfW(b, L"%s %s every %d ms...", g_cfg.mode == 2 ? L"Pinging" : L"Querying", g_server, g_cfg.period_ms);
     set_status(b);
@@ -559,13 +577,9 @@ static void stop_and_wait(DWORD ms)
     WaitForSingleObject(g_thread, ms);
 }
 
-static void analyze(void)
-{
-    WCHAR args[MAX_PATH + 16];
-    wsprintfW(args, L"/select,\"%s\"", g_path);
-    ShellExecuteW(g_dlg, NULL, L"explorer.exe", args, NULL, SW_SHOWNORMAL);
-    ShellExecuteW(g_dlg, L"open", L"https://zxc.sx/ping-analyzer", NULL, NULL, SW_SHOWNORMAL);
-}
+void analyze_open(HWND parent, const WCHAR *last);
+static int g_recorded;
+static void analyze(void) { analyze_open(g_dlg, g_recorded ? g_path : NULL); }
 
 static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -590,8 +604,8 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"ICMP ping");
         SendDlgItemMessageW(h, IDC_MODE, CB_SETCURSEL, 0, 0);
         SetDlgItemTextW(h, IDC_DOMAIN, L"google.com");
-        for (i = 0; i < 5; i++) SendDlgItemMessageW(h, IDC_RATE, CB_ADDSTRING, 0, (LPARAM)k_rate_s[i]);
-        SendDlgItemMessageW(h, IDC_RATE, CB_SETCURSEL, 0, 0);
+        for (i = 0; i < RATE_N; i++) SendDlgItemMessageW(h, IDC_RATE, CB_ADDSTRING, 0, (LPARAM)k_rate_s[i]);
+        SendDlgItemMessageW(h, IDC_RATE, CB_SETCURSEL, RATE_DEF, 0);
         for (i = 0; i < 8; i++) SendDlgItemMessageW(h, IDC_DUR, CB_ADDSTRING, 0, (LPARAM)k_dur_str[i]);
         SendDlgItemMessageW(h, IDC_DUR, CB_SETCURSEL, 3, 0);
         for (i = 0; i < 3; i++) SendDlgItemMessageW(h, IDC_TMO, CB_ADDSTRING, 0, (LPARAM)k_tmo_s[i]);
@@ -616,11 +630,11 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         WaitForSingleObject(g_thread, INFINITE);
         CloseHandle(g_thread);
         g_running = 0;
+        g_recorded = 1;
         refresh();
         SendDlgItemMessageW(h, IDC_PROG, PBM_SETMARQUEE, FALSE, 0);
         enable_inputs(TRUE);
         EnableWindow(GetDlgItem(h, IDC_START), TRUE);
-        EnableWindow(GetDlgItem(h, IDC_ANALYZE), TRUE);
         SetDlgItemTextW(h, IDC_START, L"START");
         wsprintfW(b, L"Saved %u rows: %s", g_st.written, g_path);
         set_status(b);
@@ -672,7 +686,7 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 
 void WINAPI entry(void)
 {
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_PROGRESS_CLASS | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_PROGRESS_CLASS | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES };
     WSADATA wsa;
     LARGE_INTEGER t;
     InitCommonControlsEx(&icc);

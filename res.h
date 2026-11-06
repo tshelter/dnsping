@@ -18,3 +18,13 @@
 #define IDC_ANALYZE  312
 #define IDC_START    IDOK
 #define IDC_STATUS   314
+#define IDD_ANALYZE  400
+#define IDC_A_LAST   401
+#define IDC_A_FILE   402
+#define IDC_A_PATH   403
+#define IDC_A_BROWSE 404
+#define IDC_A_GRAPH  405
+#define IDC_A_SUM    406
+#define IDC_A_EV     407
+#define IDC_A_COPY   408
+#define IDC_A_WEB    409
