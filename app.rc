@@ -6,12 +6,12 @@ IDI_APP ICON "app.ico"
 
 IDD_MAIN DIALOGEX 0, 0, 250, 304
 STYLE DS_SHELLFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
-CAPTION "DNS Ping 10 Hz"
+CAPTION "DNS Ping 10 Hz  v2"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
     LTEXT "Target", IDC_H1, 8, 5, 234, 12
     CONTROL "", -1, "Static", SS_ETCHEDHORZ, 8, 18, 234, 1
-    LTEXT "DNS server (IP or hostname)", -1, 8, 24, 234, 9
+    LTEXT "Target: DNS server, or any host for ICMP ping", -1, 8, 24, 234, 9
     COMBOBOX IDC_SERVER, 8, 34, 234, 120, CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP
     LTEXT "Query mode", -1, 8, 52, 114, 9
     LTEXT "Domain", -1, 130, 52, 112, 9
@@ -42,15 +42,15 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 2,0,0,0
+PRODUCTVERSION 2,0,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
   BLOCK "StringFileInfo" { BLOCK "040904b0" {
     VALUE "FileDescription", "DNS Ping 10 Hz - UDP DNS connectivity logger"
     VALUE "ProductName", "DNS Ping"
-    VALUE "FileVersion", "1.0"
+    VALUE "FileVersion", "2.0"
     VALUE "OriginalFilename", "dnsping.exe"
   } }
   BLOCK "VarFileInfo" { VALUE "Translation", 0x409, 1200 }

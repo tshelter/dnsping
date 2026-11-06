@@ -13,6 +13,6 @@ ${P}gcc -std=c99 -Os -s -ffreestanding -fno-builtin -fno-tree-loop-distribute-pa
   -nostdlib -e entry -Wl,--subsystem,windows:6.0 -Wl,--gc-sections -Wl,--build-id=none \
   -Wl,--no-insert-timestamp -Wl,--disable-reloc-section -Wl,--exclude-all-symbols -Wl,--file-alignment,512 -Wl,--section-alignment,4096 \
   dnsping.c app.res.o -o dnsping.exe \
-  -lkernel32 -luser32 -lgdi32 -lcomctl32 -lcomdlg32 -lshell32 -lws2_32 -lwinmm
+  -lkernel32 -luser32 -lgdi32 -lcomctl32 -lcomdlg32 -lshell32 -lws2_32 -lwinmm -liphlpapi
 rm -f app.res.o
 ls -l dnsping.exe

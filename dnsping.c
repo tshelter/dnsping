@@ -7,6 +7,9 @@
  * number + random salt, and either 0x20 random case of a cached domain
  * (measures pure network RTT) or a random subdomain (cache-busting).
  *
+ * ICMP mode uses IcmpSendEcho2/Icmp6SendEcho2 (async, no admin rights needed);
+ * each echo carries a unique 16-byte payload that must come back intact.
+ *
  * Built without the C runtime (see build.sh) to keep the .exe tiny.
  */
 #define UNICODE
@@ -21,6 +24,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <mmsystem.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #include "res.h"
 
 #ifndef SIO_UDP_CONNRESET
@@ -43,7 +48,10 @@ typedef struct {
     LONGLONG t;                      /* QPC at send */
     FILETIME ft;                     /* wall clock at send */
     int rtt_us;
-    unsigned char q[96];             /* encoded qname as sent */
+    unsigned char q[96];             /* encoded qname / ICMP payload as sent */
+    unsigned char active;            /* ICMP request outstanding */
+    HANDLE ev;                       /* ICMP completion event */
+    unsigned char rep[192];          /* ICMP reply buffer */
 } Slot;
 
 typedef struct {
@@ -55,7 +63,7 @@ typedef struct {
 
 typedef struct {
     struct sockaddr_storage addr;
-    int addrlen, mode, period_ms, timeout_ms;
+    int addrlen, mode, /* 0 dns 0x20, 1 dns random, 2 icmp */ period_ms, timeout_ms;
     unsigned total;
     char domain[72];
     HANDLE file;
@@ -194,7 +202,8 @@ static DWORD WINAPI worker(LPVOID arg)
     unsigned short salt = (unsigned short)rnd();
     int stopping = 0, i, r;
     DWORD br, f = FALSE;
-    HANDLE hs[2];
+    HANDLE hs[64], ih = INVALID_HANDLE_VALUE;
+    int icmp = c->mode == 2, v6 = c->addr.ss_family == AF_INET6;
     SOCKET s;
     WSAEVENT ev;
     (void)arg;
@@ -203,12 +212,16 @@ static DWORD WINAPI worker(LPVOID arg)
     per = fq.QuadPart * c->period_ms / 1000;
     tmo = fq.QuadPart * c->timeout_ms / 1000;
 
-    s = socket(c->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
-    connect(s, (struct sockaddr *)&c->addr, c->addrlen);
-    WSAIoctl(s, SIO_UDP_CONNRESET, &f, sizeof f, NULL, 0, &br, NULL, NULL);
-    ev = WSACreateEvent();
-    WSAEventSelect(s, ev, FD_READ);
-    hs[0] = ev; hs[1] = g_stop;
+    if (icmp) {
+        ih = v6 ? Icmp6CreateFile() : IcmpCreateFile();
+        s = INVALID_SOCKET; ev = NULL;
+    } else {
+        s = socket(c->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+        connect(s, (struct sockaddr *)&c->addr, c->addrlen);
+        WSAIoctl(s, SIO_UDP_CONNRESET, &f, sizeof f, NULL, 0, &br, NULL, NULL);
+        ev = WSACreateEvent();
+        WSAEventSelect(s, ev, FD_READ);
+    }
     timeBeginPeriod(1);
 
     fput("Timestamp,Ping (ms),Jitter (ms)\r\n", 33);
@@ -224,16 +237,61 @@ static DWORD WINAPI worker(LPVOID arg)
             Slot *sl = &g_slots[nseq % NSLOT];
             if (now - next > per * 10) next = now;    /* resync after a stall (sleep etc.) */
             sl->seq = nseq; sl->state = 0;
-            r = build_query(pkt, sl, (unsigned short)(salt + nseq), c->mode, c->domain, nseq);
-            GetSystemTimePreciseAsFileTime(&sl->ft);
-            sl->t = qpc();
-            send(s, (char *)pkt, r, 0);
+            if (icmp) {
+                unsigned v[4];
+                DWORD ok;
+                v[0] = 0x50534e44; v[1] = nseq; v[2] = salt; v[3] = rnd();   /* "DNSP" + seq + salt + rand */
+                memcpy(sl->q, v, 16); sl->qlen = 16;
+                if (!sl->ev) sl->ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+                ResetEvent(sl->ev);
+                GetSystemTimePreciseAsFileTime(&sl->ft);
+                sl->t = qpc();
+                if (v6) {
+                    struct sockaddr_in6 src;
+                    memset(&src, 0, sizeof src); src.sin6_family = AF_INET6;
+                    ok = Icmp6SendEcho2(ih, sl->ev, NULL, NULL, &src, (struct sockaddr_in6 *)&c->addr,
+                                        sl->q, 16, NULL, sl->rep, sizeof sl->rep, c->timeout_ms);
+                } else {
+                    ok = IcmpSendEcho2(ih, sl->ev, NULL, NULL, ((struct sockaddr_in *)&c->addr)->sin_addr.s_addr,
+                                       sl->q, 16, NULL, sl->rep, sizeof sl->rep, c->timeout_ms);
+                }
+                sl->active = (ok || GetLastError() == ERROR_IO_PENDING);
+            } else {
+                r = build_query(pkt, sl, (unsigned short)(salt + nseq), c->mode, c->domain, nseq);
+                GetSystemTimePreciseAsFileTime(&sl->ft);
+                sl->t = qpc();
+                send(s, (char *)pkt, r, 0);
+            }
             nseq++;
             next += per;
         }
 
-        WSAResetEvent(ev);
-        while ((r = recv(s, (char *)pkt, sizeof pkt, 0)) >= 12) {
+        if (icmp) {
+            unsigned k;
+            for (k = wseq; k < nseq; k++) {
+                Slot *sl = &g_slots[k % NSLOT];
+                LONGLONG t;
+                const unsigned char *d = NULL;
+                if (!sl->active || WaitForSingleObject(sl->ev, 0) != WAIT_OBJECT_0) continue;
+                t = qpc();
+                sl->active = 0;
+                if (v6) {
+                    ICMPV6_ECHO_REPLY *e = (ICMPV6_ECHO_REPLY *)sl->rep;
+                    if (Icmp6ParseReplies(sl->rep, sizeof sl->rep) && e->Status == IP_SUCCESS)
+                        d = sl->rep + sizeof *e;
+                } else {
+                    ICMP_ECHO_REPLY *e = (ICMP_ECHO_REPLY *)sl->rep;
+                    if (IcmpParseReplies(sl->rep, sizeof sl->rep) && e->Status == IP_SUCCESS && e->DataSize == 16)
+                        d = e->Data;
+                }
+                if (!d || sl->state != 0) continue;
+                for (i = 0; i < 16 && d[i] == sl->q[i]; i++) ;
+                if (i != 16 || t - sl->t >= tmo) continue;
+                sl->rtt_us = (int)((t - sl->t) * 1000000 / fq.QuadPart);
+                sl->state = 1;
+            }
+        } else WSAResetEvent(ev);
+        while (!icmp && (r = recv(s, (char *)pkt, sizeof pkt, 0)) >= 12) {
             LONGLONG t = qpc();
             unsigned short id = (unsigned short)((pkt[0] << 8) | pkt[1]);
             unsigned latest, diff, seq;
@@ -269,15 +327,24 @@ static DWORD WINAPI worker(LPVOID arg)
         if (can_send && next < target) target = next;
         if (wseq < nseq && g_slots[wseq % NSLOT].t + tmo < target) target = g_slots[wseq % NSLOT].t + tmo;
         ms = target > now ? (DWORD)(((target - now) * 1000 + fq.QuadPart - 1) / fq.QuadPart) : 0;
-        if (WaitForMultipleObjects(stopping ? 1 : 2, hs, FALSE, ms) == WAIT_OBJECT_0 + 1)
-            stopping = 1;
+        {
+            int nh = 0;
+            unsigned k;
+            if (!stopping) hs[nh++] = g_stop;
+            if (!icmp) hs[nh++] = ev;
+            else for (k = wseq; k < nseq && nh < 64; k++)
+                if (g_slots[k % NSLOT].active) hs[nh++] = g_slots[k % NSLOT].ev;
+            if (!nh) Sleep(ms);
+            else if (WaitForMultipleObjects(nh, hs, FALSE, ms) == WAIT_OBJECT_0 && !stopping)
+                stopping = 1;
+        }
     }
 
     timeEndPeriod(1);
     fflush_buf();
     CloseHandle(c->file);
-    closesocket(s);
-    WSACloseEvent(ev);
+    if (icmp) IcmpCloseHandle(ih);
+    else { closesocket(s); WSACloseEvent(ev); }
     PostMessageW(g_dlg, WM_APP_DONE, 0, 0);
     return 0;
 }
@@ -304,17 +371,25 @@ static void make_autopath(void)
     for (i = 0; srv[i]; i++)
         if (srv[i] == L':' || srv[i] == L'/' || srv[i] == L'\\' || srv[i] == L'*' || srv[i] == L'?') srv[i] = L'-';
     GetLocalTime(&st);
-    wsprintfW(g_autopath, L"%s\\dnsping_%s_%04d%02d%02d-%02d%02d%02d.csv", dir, srv,
+    wsprintfW(g_autopath, L"%s\\%s_%s_%04d%02d%02d-%02d%02d%02d.csv", dir,
+              SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) == 2 ? L"icmpping" : L"dnsping", srv,
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 }
 
 static void set_status(const WCHAR *s) { SendDlgItemMessageW(g_dlg, IDC_STATUS, SB_SETTEXTW, 0, (LPARAM)s); }
+
+static void sync_mode(void)
+{
+    int icmp = SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) == 2;
+    EnableWindow(GetDlgItem(g_dlg, IDC_DOMAIN), !icmp);
+}
 
 static void enable_inputs(BOOL on)
 {
     static const int ids[] = { IDC_SERVER, IDC_MODE, IDC_DOMAIN, IDC_RATE, IDC_DUR, IDC_TMO, IDC_PATH, IDC_BROWSE };
     int i;
     for (i = 0; i < (int)(sizeof ids / sizeof ids[0]); i++) EnableWindow(GetDlgItem(g_dlg, ids[i]), on);
+    if (on) sync_mode();
 }
 
 static void refresh(void)
@@ -427,7 +502,7 @@ static void start(void)
     WideCharToMultiByte(CP_ACP, 0, domw, -1, dom, 64, NULL, NULL);
     for (i = 0; dom[i]; i++) ;
     while (i > 0 && (dom[i - 1] == '.' || dom[i - 1] == ' ')) dom[--i] = 0;
-    if (!dom[0]) { MessageBoxW(g_dlg, L"Enter a domain to query.", L"DNS Ping", MB_ICONERROR); return; }
+    if (!dom[0] && SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0) != 2) { MessageBoxW(g_dlg, L"Enter a domain to query.", L"DNS Ping", MB_ICONERROR); return; }
     lstrcpyA(g_cfg.domain, dom);
 
     g_cfg.mode = (int)SendDlgItemMessageW(g_dlg, IDC_MODE, CB_GETCURSEL, 0, 0);
@@ -471,7 +546,7 @@ static void start(void)
     enable_inputs(FALSE);
     EnableWindow(GetDlgItem(g_dlg, IDC_ANALYZE), FALSE);
     SetDlgItemTextW(g_dlg, IDC_START, L"STOP");
-    wsprintfW(b, L"Probing %s every %d ms...", g_server, g_cfg.period_ms);
+    wsprintfW(b, L"%s %s every %d ms...", g_cfg.mode == 2 ? L"Pinging" : L"Querying", g_server, g_cfg.period_ms);
     set_status(b);
     SetTimer(g_dlg, 1, 100, NULL);
     g_thread = CreateThread(NULL, 0, worker, NULL, 0, NULL);
@@ -512,6 +587,7 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         SetDlgItemTextW(h, IDC_SERVER, k_servers[0]);
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"Cached name (0x20)");
         SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"Random subdomain");
+        SendDlgItemMessageW(h, IDC_MODE, CB_ADDSTRING, 0, (LPARAM)L"ICMP ping");
         SendDlgItemMessageW(h, IDC_MODE, CB_SETCURSEL, 0, 0);
         SetDlgItemTextW(h, IDC_DOMAIN, L"google.com");
         for (i = 0; i < 5; i++) SendDlgItemMessageW(h, IDC_RATE, CB_ADDSTRING, 0, (LPARAM)k_rate_s[i]);
@@ -558,6 +634,16 @@ static INT_PTR CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
                 EnableWindow(GetDlgItem(h, IDC_START), FALSE);
                 set_status(L"Stopping (waiting for in-flight replies)...");
             } else start();
+            return TRUE;
+        case IDC_MODE:
+        case IDC_SERVER:
+            if (HIWORD(wp) == CBN_SELCHANGE || HIWORD(wp) == CBN_EDITCHANGE) {
+                WCHAR cur[MAX_PATH];
+                if (LOWORD(wp) == IDC_MODE) sync_mode();
+                if (LOWORD(wp) == IDC_SERVER && HIWORD(wp) == CBN_SELCHANGE) return TRUE;  /* text not updated yet */
+                GetDlgItemTextW(h, IDC_PATH, cur, MAX_PATH);
+                if (!lstrcmpW(cur, g_autopath)) { make_autopath(); SetDlgItemTextW(h, IDC_PATH, g_autopath); }
+            }
             return TRUE;
         case IDC_BROWSE: {
             OPENFILENAMEW of;
