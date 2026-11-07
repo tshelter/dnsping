@@ -8,13 +8,15 @@ to explain an outage afterwards.
 
 - Scope captured in `PLANS/v0.1.0.md`: keep dnsping's GUI idea, re-implement with each OS's
   native UI toolkit (Windows already done).
-- macOS prototype started: same layout/idea as the Windows dnsping main window — target, query
-  mode (DNS 0x20 / DNS random subdomain / ICMP / HTTP HEAD), domain, rate/duration/timeout,
-  output folder + browse, live graph, stats, progress, Start/Stop, Analyze, MTR, Pack & share.
+- macOS prototype staged under `DNSPingMac/`: native AppKit mirror of the Windows main window;
+  prototype only, real probe core still on Windows.
+- Linux prototype staged under `DNSPingLinux/`: same idea, native Linux UI; current placeholder
+  builds and runs (`make -C DNSPingLinux clean build`). Toolkit to be picked during implementation
+  so Linux gets a real native look matching macOS parity.
 - Shared core API stubbed in `common.h` so Windows/macOS/Linux front ends can stay thin and
   consistent. Windows still uses its existing implementation; macOS/Linux will use platform-native
   probe backends (raw sockets/ICMP, platform resolver, platform HTTP/TLS) instead of the Windows-
-  only Winsock/WinHTTP/icmpapi paths.
+  only Winsock/WinHTTP/icmpapi paths that dnsping.c currently uses.
 
 ## Reference design (Windows, done)
 

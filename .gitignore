@@ -8,3 +8,8 @@ app.ico
 # macOS prototype (built on a Mac host)
 DNSPingMac/.build/
 DNSPingMac/DNSPingMac.xcodeproj/
+
+# Linux prototype (built on a Linux host)
+DNSPingLinux/dnsping-linux
+DNSPingLinux/.build/
+DNSPingLinux/build/
