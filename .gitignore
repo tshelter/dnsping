@@ -4,3 +4,7 @@ app.res.o
 
 # generated icon (produced by mkicon.py during build)
 app.ico
+
+# macOS prototype (built on a Mac host)
+DNSPingMac/.build/
+DNSPingMac/DNSPingMac.xcodeproj/
