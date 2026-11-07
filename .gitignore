@@ -1,2 +1,6 @@
+# build artifacts
 dnsping.exe
+app.res.o
+
+# generated icon (produced by mkicon.py during build)
 app.ico
