@@ -88,9 +88,17 @@ void  mtr_window(void *parent);         /* platform-native live window if suppor
    shows timeline + outage list through the platform front end. */
 void  analyze_open(const char *last_path);
 
-/* ---------- platform guard (Windows already has everything) ---------- */
+/* ---------- platform guard ---------- */
 #ifdef _WIN32
 #define HAVE_WIN32 1
+#endif
+
+#ifdef __APPLE__
+#define HAVE_MACOS 1
+#endif
+
+#ifdef __linux__
+#define HAVE_LINUX 1
 #endif
 
 #endif

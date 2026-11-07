@@ -13,3 +13,7 @@ DNSPingMac/DNSPingMac.xcodeproj/
 DNSPingLinux/dnsping-linux
 DNSPingLinux/.build/
 DNSPingLinux/build/
+
+# probe-core build artifacts
+core_win.o
+core_posix.o
